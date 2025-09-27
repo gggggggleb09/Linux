@@ -1,30 +1,25 @@
+
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 int main(){
 
-char input[100];
+char input[1000];
 
 while(1){
-
-printf("> ");
-if(fgets (input,100,stdin) == NULL)
-{
-
-printf("Error\n");
+fgets(input,100,stdin);
+input[strlen(input) -1] ='\0';
+if(strcmp(input, "\\q") == 0){
 break;
-
 }
-input[strcspn(input, "\n")] = '\0';
+printf("enter command to continue\n");
+fgets(input, sizeof(input),stdin);
+input[strcspn(input , "\n")] = 0;
+if(strncmp(input, "debug ", 6) == 0){
+printf("%s\n", input + 6);
 
-if(strcmp(input, "/q") == 0) {
-printf("exiting programm...\n");
-break;
-
+printf("%s: command not found\n", input);
 }
-
-printf("entering: %s \n",input);
-}
-
 return 0;
 }
