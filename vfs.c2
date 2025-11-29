@@ -1,0 +1,375 @@
+#define FUSE_USE_VERSION 31
+#define MAX_USERS 1000
+#include <fuse3/fuse.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <pwd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
+
+static int vfs_pid = -1;
+
+// Статический массив для хранения информации о пользователях
+static struct passwd *users_list[MAX_USERS];
+static int users_count = 0;
+
+int get_users_list() {
+    setpwent(); // Сброс указателя в файле паролей
+    
+    struct passwd *pwd;
+    users_count = 0;
+    
+    // Читаем пользователей напрямую в статический массив
+    while ((pwd = getpwent()) != NULL && users_count < MAX_USERS) {
+        users_list[users_count++] = pwd;
+    }
+    
+    endpwent();
+    return users_count;
+}
+
+void free_users_list() {
+    // Не нужно освобождать память, так как мы используем статические указатели
+    users_count = 0;
+}
+
+// Поиск пользователя по имени
+struct passwd* find_user_by_name(const char *name) {
+    for (int i = 0; i < users_count; i++) {
+        if (strcmp(users_list[i]->pw_name, name) == 0) {
+            return users_list[i];
+        }
+    }
+    return NULL;
+}
+
+// Поиск пользователя по пути
+struct passwd* find_user_by_path(const char *path) {
+    if (strlen(path) <= 1) return NULL;
+    
+    const char *username = path + 1; // Пропускаем первый '/'
+    return find_user_by_name(username);
+}
+
+static int users_readdir(
+    const char *path, 
+    void *buf, 
+    fuse_fill_dir_t filler,
+    off_t offset,
+    struct fuse_file_info *fi,
+    enum fuse_readdir_flags flags
+) {
+    (void) offset;
+    (void) fi;
+    (void) flags;
+
+    filler(buf, ".", NULL, 0, 0);
+    filler(buf, "..", NULL, 0, 0);
+
+    // Корневой каталог - список пользователей
+    if (strcmp(path, "/") == 0) {
+        for (int i = 0; i < users_count; i++) {
+            filler(buf, users_list[i]->pw_name, NULL, 0, 0);
+        }
+        return 0;
+    }
+
+    // Каталог пользователя
+    struct passwd *user = find_user_by_path(path);
+    if (user) {
+        filler(buf, "id", NULL, 0, 0);
+        filler(buf, "home", NULL, 0, 0);
+        filler(buf, "shell", NULL, 0, 0);
+        return 0;
+    }
+
+    return -ENOENT;
+}
+
+static int users_open(const char *path, struct fuse_file_info *fi) {
+    // Разрешаем открытие только файлов в каталогах пользователей
+    if (strcmp(path, "/") == 0) {
+        return -EISDIR;
+    }
+    
+    // Проверяем, что это файл пользователя (id, home, shell)
+    const char *last_slash = strrchr(path, '/');
+    if (!last_slash) {
+        return -ENOENT;
+    }
+    
+    char username[32];
+    char filename[32];
+    
+    // Извлекаем имя пользователя и имя файла
+    const char *user_start = path + 1; // Пропускаем первый '/'
+    const char *file_start = last_slash + 1;
+    
+    if (file_start - user_start - 1 >= sizeof(username)) {
+        return -ENOENT;
+    }
+    
+    strncpy(username, user_start, file_start - user_start - 1);
+    username[file_start - user_start - 1] = '\0';
+    strncpy(filename, file_start, sizeof(filename) - 1);
+    filename[sizeof(filename) - 1] = '\0';
+    
+    struct passwd *user = find_user_by_name(username);
+    if (!user) {
+        return -ENOENT;
+    }
+    
+    // Проверяем допустимые имена файлов
+    if (strcmp(filename, "id") != 0 && 
+        strcmp(filename, "home") != 0 && 
+        strcmp(filename, "shell") != 0) {
+        return -ENOENT;
+    }
+    
+    return 0;
+}
+
+static int users_read(
+    const char *path, 
+    char *buf, 
+    size_t size,
+    off_t offset,
+    struct fuse_file_info *fi
+) {
+    // Корневой каталог - нельзя читать
+    if (strcmp(path, "/") == 0) {
+        return -EISDIR;
+    }
+    
+    const char *last_slash = strrchr(path, '/');
+    if (!last_slash) {
+        return -ENOENT;
+    }
+    
+    char username[32];
+    char filename[32];
+    
+    // Извлекаем имя пользователя и имя файла
+    const char *user_start = path + 1;
+    const char *file_start = last_slash + 1;
+    
+    if (file_start - user_start - 1 >= sizeof(username)) {
+        return -ENOENT;
+    }
+    
+    strncpy(username, user_start, file_start - user_start - 1);
+    username[file_start - user_start - 1] = '\0';
+    strncpy(filename, file_start, sizeof(filename) - 1);
+    filename[sizeof(filename) - 1] = '\0';
+    
+    struct passwd *user = find_user_by_name(username);
+    if (!user) {
+        return -ENOENT;
+    }
+    
+    const char *content = NULL;
+    char buffer[256];
+    
+    if (strcmp(filename, "id") == 0) {
+        snprintf(buffer, sizeof(buffer), "%d\n", user->pw_uid);
+        content = buffer;
+    } else if (strcmp(filename, "home") == 0) {
+        snprintf(buffer, sizeof(buffer), "%s\n", user->pw_dir);
+        content = buffer;
+    } else if (strcmp(filename, "shell") == 0) {
+        snprintf(buffer, sizeof(buffer), "%s\n", user->pw_shell);
+        content = buffer;
+    } else {
+        return -ENOENT;
+    }
+    
+    size_t len = strlen(content);
+    if (offset >= len) {
+        return 0;
+    }
+    
+    if (offset + size > len) {
+        size = len - offset;
+    }
+    
+    memcpy(buf, content + offset, size);
+    return size;
+}
+
+static int users_getattr(const char *path, struct stat *stbuf,
+                         struct fuse_file_info *fi) {
+    (void) fi;
+    
+    memset(stbuf, 0, sizeof(struct stat));
+    
+    // Корневой каталог
+    if (strcmp(path, "/") == 0) {
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+        return 0;
+    }
+    
+    // Проверяем, является ли путь каталогом пользователя
+    struct passwd *user = find_user_by_path(path);
+    if (user) {
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+        return 0;
+    }
+    
+    // Проверяем, является ли путь файлом в каталоге пользователя
+    const char *last_slash = strrchr(path, '/');
+    if (last_slash) {
+        char username[32];
+        char filename[32];
+        
+        const char *user_start = path + 1;
+        const char *file_start = last_slash + 1;
+        
+        if (file_start - user_start - 1 < sizeof(username)) {
+            strncpy(username, user_start, file_start - user_start - 1);
+            username[file_start - user_start - 1] = '\0';
+            strncpy(filename, file_start, sizeof(filename) - 1);
+            filename[sizeof(filename) - 1] = '\0';
+            
+            user = find_user_by_name(username);
+            if (user && (strcmp(filename, "id") == 0 || 
+                        strcmp(filename, "home") == 0 || 
+                        strcmp(filename, "shell") == 0)) {
+                stbuf->st_mode = S_IFREG | 0444;
+                stbuf->st_nlink = 1;
+                
+                // Устанавливаем размер файла
+                if (strcmp(filename, "id") == 0) {
+                    stbuf->st_size = snprintf(NULL, 0, "%d\n", user->pw_uid);
+                } else if (strcmp(filename, "home") == 0) {
+                    stbuf->st_size = snprintf(NULL, 0, "%s\n", user->pw_dir);
+                } else if (strcmp(filename, "shell") == 0) {
+                    stbuf->st_size = snprintf(NULL, 0, "%s\n", user->pw_shell);
+                }
+                return 0;
+            }
+        }
+    }
+    
+    return -ENOENT;
+}
+
+static int users_mkdir(const char *path, mode_t mode) {
+    // Проверяем, что создается каталог пользователя в корне
+    if (strlen(path) <= 1) {
+        return -EINVAL;
+    }
+    
+    const char *username = path + 1;
+    
+    // Проверяем, что пользователя еще нет в системе
+    if (find_user_by_name(username)) {
+        return -EEXIST;
+    }
+    
+    // Вызываем adduser для создания пользователя
+    char command[256];
+    snprintf(command, sizeof(command), "sudo adduser --disabled-password --gecos '' %s", username);
+    
+    int result = system(command);
+    if (result != 0) {
+        return -EIO;
+    }
+    
+    // Обновляем список пользователей
+    free_users_list();
+    get_users_list();
+    
+    return 0;
+}
+
+static int users_rmdir(const char *path) {
+    // Проверяем, что удаляется каталог пользователя
+    if (strlen(path) <= 1) {
+        return -EINVAL;
+    }
+    
+    const char *username = path + 1;
+    struct passwd *user = find_user_by_name(username);
+    
+    if (!user) {
+        return -ENOENT;
+    }
+    
+    // Вызываем userdel для удаления пользователя
+    char command[256];
+    snprintf(command, sizeof(command), "sudo userdel -r %s", username);
+    
+    int result = system(command);
+    if (result != 0) {
+        return -EIO;
+    }
+    
+    // Обновляем список пользователей
+    free_users_list();
+    get_users_list();
+    
+    return 0;
+}
+
+static struct fuse_operations users_oper = {
+    .getattr = users_getattr,
+    .open = users_open,
+    .read = users_read,
+    .readdir = users_readdir,
+    .mkdir = users_mkdir,
+    .rmdir = users_rmdir,
+};
+
+int start_users_vfs(const char *mount_point) {
+    // Создаем каталог для монтирования, если его нет
+    struct stat st;
+    if (stat(mount_point, &st) == -1) {
+        if (mkdir(mount_point, 0755) == -1) {
+            perror("Ошибка создания каталога для монтирования");
+            return -1;
+        }
+    }
+    
+    int pid = fork();    
+    if (pid == 0) {
+        char *fuse_argv[] = {
+            "users_vfs",
+            "-f",
+            "-s",
+            (char*)mount_point,
+            NULL
+        };
+
+        if (get_users_list() <= 0) {
+            fprintf(stderr, "Не удалось получить список пользователей\n");
+            exit(1);
+        }
+
+        int ret = fuse_main(4, fuse_argv, &users_oper, NULL);
+
+        free_users_list();
+        exit(ret);
+    } else {
+        vfs_pid = pid;
+        printf("VFS запущена в процессе %d, монтирована в %s\n", pid, mount_point);
+        return 0;
+    }
+}
+
+void stop_users_vfs() {
+    if (vfs_pid != -1) {
+        kill(vfs_pid, SIGTERM);
+        waitpid(vfs_pid, NULL, 0);
+        vfs_pid = -1;
+        printf("VFS остановлена\n");
+    }
+}
